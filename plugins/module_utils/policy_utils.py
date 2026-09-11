@@ -17,6 +17,9 @@
 from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
+from collections import Counter
+
+HAS_VCERT = True
 try:
     from vcert.parser import FIELD_OWNERS, FIELD_APPROVERS, FIELD_USER_ACCESS, FIELD_DOMAINS, FIELD_POLICY, \
         FIELD_WILDCARD_ALLOWED, FIELD_MAX_VALID_DAYS, FIELD_CERTIFICATE_AUTHORITY, FIELD_AUTOINSTALLED, FIELD_SUBJECT, \
@@ -25,12 +28,12 @@ try:
         FIELD_SUBJECT_ALT_NAMES, FIELD_DNS_ALLOWED, FIELD_EMAIL_ALLOWED, FIELD_IP_ALLOWED, FIELD_UPN_ALLOWED, \
         FIELD_URI_ALLOWED, FIELD_DEFAULTS, FIELD_DEFAULT_DOMAIN, FIELD_DEFAULT_AUTOINSTALLED, FIELD_DEFAULT_SUBJECT, \
         FIELD_DEFAULT_ORG, FIELD_DEFAULT_LOCALITY, FIELD_DEFAULT_STATE, FIELD_DEFAULT_COUNTRY, FIELD_DEFAULT_KEY_PAIR, \
-        FIELD_DEFAULT_ELLIPTIC_CURVE, FIELD_DEFAULT_RSA_KEY_SIZE, FIELD_DEFAULT_SERVICE_GENERATED, FIELD_DEFAULT_KEY_TYPE, \
-        FIELD_USERS
+        FIELD_DEFAULT_ELLIPTIC_CURVE, FIELD_DEFAULT_RSA_KEY_SIZE, FIELD_DEFAULT_SERVICE_GENERATED, \
+        FIELD_DEFAULT_KEY_TYPE, FIELD_USERS
+    from vcert.policy.policy_spec import DEFAULT_CA
 except ImportError:
-    HAS_VCERT = True
-else:
     HAS_VCERT = False
+    DEFAULT_CA = None
 
 ERR_MSG = '%s changed. Local: %s Remote: %s'
 EMPTY_MSG = '%s structure is empty on %s but exists on %s'
@@ -67,12 +70,16 @@ def _get_empty_msg(name, empty_type):
     return ''
 
 
-def check_policy_specification(local_ps, remote_ps):
+def check_policy_specification(local_ps, remote_ps, ignore_owners_users=False):
     """
     Validates that all values present in the source vcert.policy.PolicySpecification match with
     the current output PolicySpecification
     :param vcert.policy.PolicySpecification local_ps:
     :param vcert.policy.PolicySpecification remote_ps:
+    :param bool ignore_owners_users: skip owners/users/approvers/user_access comparison. NGTS
+        (Strata Cloud Manager) has no Application/owner layer, so get_policy always returns them
+        empty and set_policy ignores them; comparing a local file that lists them would report
+        changed forever (parity with the Go NGTS connector).
     :rtype: tuple[bool, list[str]]
     """
     is_changed = False
@@ -81,11 +88,11 @@ def check_policy_specification(local_ps, remote_ps):
     list_fields = []
     value_fields = []
 
-    list_fields.append((FIELD_OWNERS, remote_ps.owners, local_ps.owners))
-    list_fields.append((FIELD_USERS, remote_ps.users, local_ps.users))
-    list_fields.append((FIELD_APPROVERS, remote_ps.approvers, local_ps.approvers))
-
-    value_fields.append((FIELD_USER_ACCESS, remote_ps.user_access, local_ps.user_access))
+    if not ignore_owners_users:
+        list_fields.append((FIELD_OWNERS, local_ps.owners, remote_ps.owners))
+        list_fields.append((FIELD_USERS, local_ps.users, remote_ps.users))
+        list_fields.append((FIELD_APPROVERS, local_ps.approvers, remote_ps.approvers))
+        value_fields.append((FIELD_USER_ACCESS, local_ps.user_access, remote_ps.user_access))
 
     # Validating Policy
     empty_local_p = _is_empty_object(local_ps.policy)
@@ -101,12 +108,17 @@ def check_policy_specification(local_ps, remote_ps):
         remote_p = remote_ps.policy
         p = '%s.' % FIELD_POLICY
 
-        list_fields.append((p + FIELD_DOMAINS, remote_p.domains, local_p.domains))
+        list_fields.append((p + FIELD_DOMAINS, local_p.domains, remote_p.domains))
 
         value_fields.append((p + FIELD_WILDCARD_ALLOWED, local_p.wildcard_allowed, remote_p.wildcard_allowed))
         value_fields.append((p + FIELD_MAX_VALID_DAYS, local_p.max_valid_days, remote_p.max_valid_days))
-        value_fields.append((p + FIELD_CERTIFICATE_AUTHORITY, local_p.certificate_authority,
-                             remote_p.certificate_authority))
+        # The vcert Policy constructor forces certificate_authority to DEFAULT_CA when the user omits
+        # it, so only compare when the local spec actually pinned a CA. Otherwise a local file that
+        # does not mention a CA is compared against the remote's real CA and reports a false
+        # 'changed' on every run.
+        if local_p.certificate_authority and local_p.certificate_authority != DEFAULT_CA:
+            value_fields.append((p + FIELD_CERTIFICATE_AUTHORITY, local_p.certificate_authority,
+                                 remote_p.certificate_authority))
         value_fields.append((p + FIELD_AUTOINSTALLED, local_p.auto_installed, remote_p.auto_installed))
 
         # Validating Policy.Subject
@@ -147,7 +159,14 @@ def check_policy_specification(local_ps, remote_ps):
             value_fields.append((p + FIELD_REUSE_ALLOWED, local_kp.reuse_allowed, remote_kp.reuse_allowed))
 
             list_fields.append((p + FIELD_RSA_KEY_SIZES, local_kp.rsa_key_sizes, remote_kp.rsa_key_sizes))
-            list_fields.append((p + FIELD_ELLIPTIC_CURVES, local_kp.elliptic_curves, remote_kp.elliptic_curves))
+
+            # elliptic_curves is case-insensitive: vcert 0.22.1 get_policy returns UPPERCASE curves
+            # (e.g. "P256") while users write them lowercase, so a case-sensitive compare reports a
+            # false 'changed' every run. Compare like key_types.
+            if not _check_list_case_insensitive(remote_kp.elliptic_curves, local_kp.elliptic_curves):
+                is_changed = True
+                msgs.append(_get_err_msg(p + FIELD_ELLIPTIC_CURVES, local_kp.elliptic_curves,
+                                         remote_kp.elliptic_curves))
 
             if not _check_key_types(remote_kp.key_types, local_kp.key_types):
                 is_changed = True
@@ -198,13 +217,13 @@ def check_policy_specification(local_ps, remote_ps):
             msgs.append(_get_empty_msg('Defaults.DefaultSubject', LOCAL))
         elif not empty_local_ds and empty_remote_ds:
             is_changed = True
-            msgs.append(msgs.append('Defaults.DefaultSubject', REMOTE))
+            msgs.append(_get_empty_msg('Defaults.DefaultSubject', REMOTE))
         elif not empty_local_ds and not empty_remote_ds:
             local_ds = local_d.subject
             remote_ds = remote_d.subject
             p = '%s.%s.' % (FIELD_DEFAULTS, FIELD_DEFAULT_SUBJECT)
 
-            list_fields.append((remote_ds.org_units, local_ds.org_units))
+            list_fields.append((p + FIELD_ORG_UNITS, local_ds.org_units, remote_ds.org_units))
 
             value_fields.append((p + FIELD_DEFAULT_ORG, local_ds.org, remote_ds.org))
             value_fields.append((p + FIELD_DEFAULT_LOCALITY, local_ds.locality, remote_ds.locality))
@@ -225,12 +244,23 @@ def check_policy_specification(local_ps, remote_ps):
             remote_dkp = remote_d.key_pair
             p = '%s.%s.' % (FIELD_DEFAULTS, FIELD_DEFAULT_KEY_PAIR)
 
-            value_fields.append((p + FIELD_DEFAULT_ELLIPTIC_CURVE, local_dkp.elliptic_curve, remote_dkp.elliptic_curve))
             value_fields.append((p + FIELD_DEFAULT_RSA_KEY_SIZE, local_dkp.rsa_key_size, remote_dkp.rsa_key_size))
             value_fields.append((p + FIELD_DEFAULT_SERVICE_GENERATED, local_dkp.service_generated,
                                  remote_dkp.service_generated))
 
-            if local_dkp.key_type.upper() != remote_dkp.key_type.upper():
+            # default elliptic_curve: None-safe, case-insensitive (see elliptic_curves above).
+            lc = local_dkp.elliptic_curve
+            rc = remote_dkp.elliptic_curve
+            if (lc.upper() if lc else lc) != (rc.upper() if rc else rc):
+                is_changed = True
+                msgs.append(_get_err_msg(p + FIELD_DEFAULT_ELLIPTIC_CURVE, local_dkp.elliptic_curve,
+                                         remote_dkp.elliptic_curve))
+
+            # default key_type: guard None before .upper() (DefaultKeyPair.key_type defaults to None,
+            # but this branch is reachable when only rsa_key_size or elliptic_curve is set).
+            lkt = local_dkp.key_type
+            rkt = remote_dkp.key_type
+            if (lkt.upper() if lkt else lkt) != (rkt.upper() if rkt else rkt):
                 is_changed = True
                 msgs.append(_get_err_msg(p + FIELD_DEFAULT_KEY_TYPE, local_dkp.key_type, remote_dkp.key_type))
 
@@ -281,20 +311,30 @@ def _is_empty_object(obj):
 
 def _check_list(remote_values, local_values):
     """
-    Tests that all the elements of the sublist are present in the collection
+    Order-independent multiset equality of two lists (None treated as empty).
+
+    A plain "same length and every remote value is in local" check reports equal for
+    ([1, 1], [1, 2]) and is asymmetric, so it can miss a genuine drift. Counter equality is
+    exact multiset equality.
 
     :param list remote_values: The tested values
     :param list local_values: The member values
     :rtype: bool
     """
-    if remote_values is None:
-        remote_values = []
-    if local_values is None:
-        local_values = []
-    if len(remote_values) == len(local_values):
-        return all(x in local_values for x in remote_values)
-    else:
-        return False
+    return Counter(remote_values or []) == Counter(local_values or [])
+
+
+def _check_list_case_insensitive(remote_values, local_values):
+    """
+    Order-independent, case-insensitive multiset equality for lists of strings
+    (None treated as empty). Used for elliptic curves and key types, which the platform
+    returns upper-cased while users typically write them lower-cased.
+
+    :rtype: bool
+    """
+    remote_counts = Counter(str(x).upper() for x in (remote_values or []))
+    local_counts = Counter(str(x).upper() for x in (local_values or []))
+    return remote_counts == local_counts
 
 
 def _check_value(remote_value, local_value):
@@ -324,10 +364,4 @@ def _check_key_types(remote_values, local_values):
     :param list[str] local_values:
     :rtype: bool
     """
-    copy = []
-    for val in local_values:
-        copy.append(val.upper())
-    if len(remote_values) == len(local_values):
-        return all(x.upper() in copy for x in remote_values)
-    else:
-        return False
+    return _check_list_case_insensitive(remote_values, local_values)

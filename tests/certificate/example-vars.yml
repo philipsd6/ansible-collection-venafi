@@ -18,7 +18,7 @@ certificate_alt_name: "IP:192.168.1.1,DNS:www.venafi.example.com,DNS:m.venafi.ex
 
 certificate_privatekey_type: "RSA"
 certificate_privatekey_size: "2048"
-certificate_privatekey_curve: "P251"
+certificate_privatekey_curve: "P256"
 certificate_privatekey_passphrase: "password"
 certificate_chain_option: "last"
 

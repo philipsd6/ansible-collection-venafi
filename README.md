@@ -13,10 +13,24 @@ If you like this collection, please give us a rating on [Ansible Galaxy](https:/
 ## Requirements
 
 Review the [CyberArk](https://github.com/Venafi/vcert-python#prerequisites-for-using-with-trust-protection-platform)
-prerequisites, then install Ansible and [VCert-Python](https://github.com/Venafi/vcert-python) (v0.11.2 or higher) using `pip`:
+prerequisites, and depending on the source:
+
+### Ansible Automation Platform
+
+- Install [VCert-Python](https://github.com/Venafi/vcert-python) (v0.18.0 or higher) using `pip`:
+
+```sh
+pip install vcert --upgrade
+```
+
+### Ansible Galaxy
+
+- Install both Ansible and [VCert-Python](https://github.com/Venafi/vcert-python) (v0.18.0 or higher) using `pip`:
+
 ```sh
 pip install ansible vcert --upgrade
 ```
+
 <!-- TODO: clarify the different requirements for CyberArk Certificate Manager, Self-Hosted and CyberArk Certificate Manager, SaaS -->
 
 ## Python version compatibility
@@ -52,7 +66,11 @@ collections:
 The python module dependencies are not installed by `ansible-galaxy`.  They can
 be manually installed using pip:
 
-    pip install -r requirements.txt
+    pip install --require-hashes -r requirements.txt
+
+`requirements.txt` is a generated lockfile. Do not edit it directly. To change
+or upgrade a dependency, edit `requirements.in` and run `make lock` (requires
+Docker) to regenerate it.
 
 or:
 
@@ -62,14 +80,36 @@ or:
 
 ### Roles
 
-- [`venafi.machine_identity.certificate`](roles/certificate/README.md): Enrolls a certificate and optionally deploys it to a remote location.
+- [`venafi.machine_identity.certificate`](roles/certificate/README.md): Enrolls a certificate from CyberArk Certificate Manager Self-Hosted, SaaS, or NGTS (Strata Cloud Manager) and optionally deploys it to a remote location.
 - [`venafi.machine_identity.policy`](roles/policy/README.md): Creates or updates certificate policy on CyberArk Certificate Manager, SaaS or CyberArk Certificate Manager, Self-Hosted using a specification file.
 - [`venafi.machine_identity.ssh_certificate`](roles/ssh_certificate/README.md): Enrolls an SSH certificate using CyberArk Certificate Manager, Self-Hosted.
 - [`venafi.machine_identity.ssh_ca`](roles/ssh_ca/README.md): Retrieves public keys of SSH certificate authorities hosted by CyberArk Certificate Manager, Self-Hosted.
 
+## Security Considerations
+
+### Remote Execution Mode
+
+**WARNING**: The `certificate_remote_execution`, `ssh_remote_execution`, and `ssh_ca_remote_execution` options are disabled by default for security reasons. When enabled, these options cause Ansible to transmit your Venafi platform credentials (url, user, password, access_token, token, and the NGTS service-account credentials client_id, client_secret, token_url, tsg_id) to every managed host in your inventory. These credentials are **not** scoped to individual hosts—they can request certificates for any name allowed by the Venafi zone.
+
+**Risk**: If any managed host is compromised, an attacker can extract these zone-wide credentials from temporary files and use them to request trusted certificates for all servers in your infrastructure.
+
+**Recommendations**:
+- Only enable remote execution in highly trusted environments where all managed hosts are secured to the same level as your Ansible controller.
+- Consider using the default local execution mode (`*_remote_execution: false`), which keeps credentials on the Ansible controller and only copies certificate artifacts to managed hosts.
+- If remote execution is required, implement additional controls such as per-host credentials with narrowly-scoped policies.
+
 ## Version History
 
 [Check version history here](https://github.com/Venafi/ansible-collection-venafi/blob/main/docs/version_history.md)
+
+## Support
+
+Only the latest release of this collection is supported.
+
+As Red Hat Ansible Certified Content, this collection is entitled to support through the Ansible Automation Platform (AAP) using 
+the Create issue button in the top right corner. If a support case cannot be opened with Red Hat and the collection has been obtained 
+either from Galaxy or GitHub, you can raise a GitHub Issue directly with the developers [here](https://github.com/Venafi/ansible-collection-venafi/issues)
+or get community help available on the [Ansible Forum](https://forum.ansible.com/).
 
 ## License
 

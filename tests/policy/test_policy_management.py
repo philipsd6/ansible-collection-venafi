@@ -26,6 +26,8 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 SOURCE_PATH = '/tmp/ps_source.json'
 
 
+@unittest.skipUnless(TPP_ACCESS_TOKEN and TPP_TOKEN_URL,
+                     "live TPP integration test; set TPP_ACCESS_TOKEN/TPP_TOKEN_URL to run")
 class TestPolicyManagementTPP(unittest.TestCase):
     def test_get_policy(self):
         params = self.get_params()
@@ -45,6 +47,8 @@ class TestPolicyManagementTPP(unittest.TestCase):
         return get_params(PLATFORM_TPP)
 
 
+@unittest.skipUnless(CLOUD_APIKEY and CLOUD_URL,
+                     "live VaaS integration test; set CLOUD_APIKEY/CLOUD_URL to run")
 class TestPolicyManagementVaaS(unittest.TestCase):
     def test_get_policy(self):
         params = self.get_params()
@@ -75,6 +79,12 @@ def get_params(platform):
         'access_token': '',
         'token': '',
         'trust_bundle': '',
+        # NGTS connection fields read unconditionally by get_venafi_connection()
+        'client_id': '',
+        'client_secret': '',
+        'token_url': '',
+        'tsg_id': '',
+        'scope': '',
         'zone': '',
         'policy_spec_path': SOURCE_PATH,
         'policy_spec_output_path': '',

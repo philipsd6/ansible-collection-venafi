@@ -20,6 +20,11 @@
     password: "{{ venafi.password | default(omit) }}"
     access_token: "{{ venafi.access_token | default(omit) }}"
     trust_bundle: "{{ venafi.trust_bundle | default(omit) }}"
+    client_id: "{{ venafi.client_id | default(omit) }}"
+    client_secret: "{{ venafi.client_secret | default(omit) }}"
+    token_url: "{{ venafi.token_url | default(omit) }}"
+    tsg_id: "{{ venafi.tsg_id | default(omit) }}"
+    scope: "{{ venafi.scope | default(omit) }}"
     cert_path: "{{ certificate_cert_path }}"
     chain_path: "{{ certificate_chain_path | default(omit) }}"
     csr_origin: "{{ certificate_csr_origin | default(omit) }}"
@@ -55,7 +60,7 @@
   ansible.builtin.copy:
     src: "{{ certificate_cert_path_pkcs12 }}"
     dest: "{{ certificate_remote_cert_path_pkcs12 if certificate_remote_cert_path_pkcs12 is defined else certificate_cert_path_pkcs12 }}"
-    mode: 0644
+    mode: 0600
   when: certificate_pkcs12_format
 
 - name: "Copy CyberArk private key file to remote location {{ certificate_remote_privatekey_path if certificate_remote_privatekey_path else certificate_privatekey_path }}"

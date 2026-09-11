@@ -15,6 +15,11 @@
     password: "{{ venafi.password | default(omit) }}"
     access_token: "{{ venafi.access_token | default(omit) }}"
     trust_bundle: "{{ venafi.trust_bundle | default(omit) }}"
+    client_id: "{{ venafi.client_id | default(omit) }}"
+    client_secret: "{{ venafi.client_secret | default(omit) }}"
+    token_url: "{{ venafi.token_url | default(omit) }}"
+    tsg_id: "{{ venafi.tsg_id | default(omit) }}"
+    scope: "{{ venafi.scope | default(omit) }}"
     zone: "{{ venafi.zone | default(omit) }}"
     policy_spec_path: "{{ policy_spec_path | default(omit) }}"
   delegate_to: localhost

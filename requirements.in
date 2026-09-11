@@ -1,0 +1,2 @@
+vcert>=0.22.1
+cryptography>=42.0.2

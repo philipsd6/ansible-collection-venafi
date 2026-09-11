@@ -17,11 +17,10 @@
 from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
+HAS_VCERT = True
 try:
-    from vcert import Connection, venafi_connection, IssuerHint, Authentication
+    from vcert import Connection, venafi_connection, IssuerHint, Authentication, VenafiPlatform
 except ImportError:
-    HAS_VCERT = True
-else:
     HAS_VCERT = False
 
 F_TEST_MODE = 'test_mode'
@@ -35,11 +34,52 @@ F_STATE = 'state'
 F_FORCE = 'force'
 F_STATE_PRESENT = 'present'
 F_STATE_ABSENT = 'absent'
+# NGTS (Strata Cloud Manager) OAuth2 service-account options
+F_CLIENT_ID = 'client_id'
+F_CLIENT_SECRET = 'client_secret'
+F_TOKEN_URL = 'token_url'
+F_TSG_ID = 'tsg_id'
+F_SCOPE = 'scope'
 
 DEFAULT = 'DEFAULT'
 DIGICERT = 'DIGICERT'
 ENTRUST = 'ENTRUST'
 MICROSOFT = 'MICROSOFT'
+
+# Certificate revocation reasons. The strings match the Go vcert CLI vocabulary
+# (cmd/vcert/validators.go) so users share one mental model across tools; each maps to the
+# integer code used by vcert.RevocationRequest.RevocationReasons (see get_revocation_reason).
+REVOKE_REASON_NONE = 'none'
+REVOKE_REASON_KEY_COMPROMISE = 'key-compromise'
+REVOKE_REASON_CA_COMPROMISE = 'ca-compromise'
+REVOKE_REASON_AFFILIATION_CHANGED = 'affiliation-changed'
+REVOKE_REASON_SUPERSEDED = 'superseded'
+REVOKE_REASON_CESSATION_OF_OPERATION = 'cessation-of-operation'
+
+# All accepted revocation reasons, in the same order as the Go CLI. Note that 'ca-compromise'
+# is only accepted by Self-Hosted (TPP); SaaS and NGTS reject it (there is no GraphQL enum for
+# it), so callers must guard that backend combination.
+REVOCATION_REASONS = [
+    REVOKE_REASON_NONE,
+    REVOKE_REASON_KEY_COMPROMISE,
+    REVOKE_REASON_CA_COMPROMISE,
+    REVOKE_REASON_AFFILIATION_CHANGED,
+    REVOKE_REASON_SUPERSEDED,
+    REVOKE_REASON_CESSATION_OF_OPERATION,
+]
+
+# Reason string -> integer code. These are the values of vcert.RevocationRequest.RevocationReasons
+# (NoReason=0, key_compromise=1, ca_compromise=2, affiliation_changed=3, superseded=4,
+# cessation_of_operation=5). Kept as literals so the mapping is usable for documentation even
+# when vcert is not installed (mirrors the HAS_VCERT guard elsewhere in this module).
+_REVOCATION_REASON_CODES = {
+    REVOKE_REASON_NONE: 0,
+    REVOKE_REASON_KEY_COMPROMISE: 1,
+    REVOKE_REASON_CA_COMPROMISE: 2,
+    REVOKE_REASON_AFFILIATION_CHANGED: 3,
+    REVOKE_REASON_SUPERSEDED: 4,
+    REVOKE_REASON_CESSATION_OF_OPERATION: 5,
+}
 
 
 def venafi_common_argument_spec():
@@ -55,6 +95,14 @@ def venafi_common_argument_spec():
         token=dict(type='str', required=False, default=None, no_log=True),
         access_token=dict(type='str', required=False, default=None, no_log=True),
         trust_bundle=dict(type='str', required=False),
+        # NGTS (Strata Cloud Manager) OAuth2 service-account credentials. The connection
+        # is auto-detected as NGTS when client_id and client_secret are supplied. url and
+        # token_url are optional and default to the Palo Alto production endpoints.
+        client_id=dict(type='str', required=False, default=None, no_log=True),
+        client_secret=dict(type='str', required=False, default=None, no_log=True),
+        token_url=dict(type='str', required=False, default=None, no_log=False),
+        tsg_id=dict(type='str', required=False, default=None),
+        scope=dict(type='str', required=False, default=None),
     )
     return options
 
@@ -69,6 +117,45 @@ def module_common_argument_spec():
         force=dict(type='bool', default=False),
     )
     return options
+
+
+def is_ngts_request(module):
+    """
+    Returns True when NGTS (Strata Cloud Manager) credentials are supplied. Mirrors the SDK's
+    auto-detection: the client_id/client_secret pair is NGTS-specific.
+
+    :param ansible.module_utils.basic.AnsibleModule module:
+    :rtype: bool
+    """
+    return bool(module.params.get(F_CLIENT_ID) and module.params.get(F_CLIENT_SECRET))
+
+
+def any_ngts_field_present(module):
+    """
+    Returns True when any NGTS (Strata Cloud Manager) specific field is supplied. Used to tell an
+    incomplete NGTS attempt apart from a plain TPP/SaaS request so we can fail with a targeted
+    message instead of letting it fall through to the wrong backend.
+
+    :param ansible.module_utils.basic.AnsibleModule module:
+    :rtype: bool
+    """
+    return any(module.params.get(f) for f in (F_CLIENT_ID, F_CLIENT_SECRET, F_TOKEN_URL, F_TSG_ID, F_SCOPE))
+
+
+def fail_if_ngts(module, operation):
+    """
+    Fail fast with a clear message when NGTS credentials are supplied to a module that does not
+    support NGTS. NGTS supports certificate operations only (no policy management, no SSH).
+
+    :param ansible.module_utils.basic.AnsibleModule module:
+    :param str operation: human-readable name of the unsupported operation, for the message
+    :rtype: None
+    """
+    if is_ngts_request(module):
+        module.fail_json(
+            msg="NGTS (Strata Cloud Manager) supports certificate operations only; %s is not "
+                "available for NGTS. Use the venafi_certificate module instead." % operation
+        )
 
 
 def get_venafi_connection(module, platform=None):
@@ -86,6 +173,46 @@ def get_venafi_connection(module, platform=None):
     access_token = module.params[F_ACCESS_TOKEN]
     apikey = module.params[F_APIKEY]
     trust_bundle = module.params[F_TRUST_BUNDLE]
+    client_id = module.params[F_CLIENT_ID]
+    client_secret = module.params[F_CLIENT_SECRET]
+    token_url = module.params[F_TOKEN_URL]
+    tsg_id = module.params[F_TSG_ID]
+    scope = module.params[F_SCOPE]
+
+    # test_mode must yield the SDK fake connector for every backend. The NGTS branch below
+    # forces platform=NGTS, and venafi_connection() ignores the fake flag whenever a platform
+    # is set, so short-circuit here before backend selection to keep test_mode consistent.
+    if test_mode:
+        return venafi_connection(fake=True)
+
+    if is_ngts_request(module):
+        # NGTS requires the OAuth2 service-account pair plus a scope (or tsg_id to derive it).
+        # url and token_url are optional: the SDK defaults both to the Palo Alto production
+        # endpoints (and warns when it falls back to the production token_url), so non-production
+        # environments must set them explicitly. Force the NGTS platform so selection does not
+        # depend on which optional fields happen to be set.
+        if not tsg_id and not scope:
+            module.fail_json(msg="NGTS requires 'tsg_id' or 'scope' in addition to "
+                                 "'client_id' and 'client_secret'.")
+        return venafi_connection(
+            url=url,
+            access_token=access_token,
+            http_request_kwargs={"verify": trust_bundle} if trust_bundle else None,
+            fake=test_mode,
+            platform=VenafiPlatform.NGTS,
+            client_id=client_id,
+            client_secret=client_secret,
+            token_url=token_url,
+            tsg_id=tsg_id,
+            scope=scope,
+        )
+
+    if any_ngts_field_present(module):
+        # NGTS-specific fields were supplied but client_id/client_secret are not both present.
+        # Fail with a targeted message instead of silently routing to the TPP/SaaS path.
+        missing = [f for f in (F_CLIENT_ID, F_CLIENT_SECRET) if not module.params.get(f)]
+        module.fail_json(msg="NGTS (Strata Cloud Manager) requires both 'client_id' and "
+                             "'client_secret'. Missing: %s." % ", ".join(missing))
 
     if user != '' or password != '':
         module.warn("user/password authentication is deprecated. Use access token instead.")
@@ -133,6 +260,22 @@ def get_issuer_hint(hint):
         return IssuerHint.DEFAULT
     else:
         raise VenafiAnsibleError("Issuer Hint not valid: %s" % hint)
+
+
+def get_revocation_reason(reason):
+    """
+    Maps a revocation reason string (the Go vcert vocabulary, e.g. 'key-compromise') to the
+    integer code consumed by vcert.RevocationRequest. 'none'/None yields 0 (NoReason).
+
+    :param str reason:
+    :rtype: int
+    """
+    if not reason:
+        return _REVOCATION_REASON_CODES[REVOKE_REASON_NONE]
+    try:
+        return _REVOCATION_REASON_CODES[reason]
+    except KeyError:
+        raise VenafiAnsibleError("Revocation reason not valid: %s" % reason)
 
 
 class VenafiAnsibleError(Exception):

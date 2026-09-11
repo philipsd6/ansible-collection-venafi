@@ -106,12 +106,15 @@ options:
         type: str
     privatekey_curve:
         description:
-            - Curve name for ECDSA algorithm.
+            - Curve name for the ECDSA private key algorithm.
+            - Requires I(privatekey_type=ECDSA). Use C(ed25519) to request an Ed25519 key
+              (needs C(vcert>=0.22.0)).
         default: P521
         choices:
             - P256
             - P384
             - P521
+            - ed25519
         type: str
     privatekey_passphrase:
         description:
@@ -167,6 +170,9 @@ options:
     zone:
         description:
             - The location of the certificate on the Venafi platform.
+            - For CyberArk Certificate Manager, Self-Hosted this is a policy folder DN (e.g. C(example\\policy)).
+            - For CyberArk Certificate Manager, SaaS this is C(ApplicationName\\IssuingTemplateAlias).
+            - For NGTS (Strata Cloud Manager) this is the Certificate Issuing Template alias only.
         required: true
         type: str
 extends_documentation_fragment:
@@ -236,6 +242,29 @@ EXAMPLES = '''
   - name: dump test output
     debug:
       msg: '{{ certout }}'
+
+# Enroll NGTS (Strata Cloud Manager) certificate
+- name: venafi_certificate_ngts
+  connection: local
+  hosts: localhost
+  tags:
+    - ngts
+  tasks:
+  - name: venafi_certificate
+    venafi_certificate:
+      # url and token_url are optional; omit them to use the Palo Alto production endpoints,
+      # set them for non-production environments.
+      client_id: 'svc-account@1234567890.iam.panserviceaccount.com'
+      client_secret: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+      tsg_id: '1234567890'
+      zone: 'my-issuing-template'
+      cert_path: '/tmp'
+      common_name: 'testcert-ngts.example.com'
+    register: certout
+  - name: dump test output
+    debug:
+      msg: '{{ certout }}'
 '''
 
 RETURN = '''
@@ -252,7 +281,7 @@ privatekey_size:
     sample: 4096
 
 privatekey_curve:
-    description: ECDSA curve of generated private key. Variants are "P521", "P384", "P256", "P224".
+    description: ECDSA curve of generated private key. Variants are "P521", "P384", "P256", "ed25519".
     returned: changed or success
     type: string
     sample: "P521"
@@ -277,11 +306,12 @@ chain_filename:
 '''
 
 import datetime
+import os
 import os.path
 import random
 
 from ansible.module_utils.basic import AnsibleModule
-from ansible.module_utils._text import to_bytes, to_text
+from ansible.module_utils.common.text.converters import to_bytes, to_text
 try:
     from ansible_collections.venafi.machine_identity.plugins.module_utils.common_utils \
         import get_venafi_connection, module_common_argument_spec, venafi_common_argument_spec, get_issuer_hint, \
@@ -333,6 +363,15 @@ F_USE_PKCS12 = "use_pkcs12_format"
 F_VALIDITY_HOURS = "validity_hours"
 F_ISSUER_HINT = "issuer_hint"
 F_CUSTOM_FIELDS = "custom_fields"
+
+
+def _normalize_curve(curve):
+    """Normalize an EC curve/key label for case- and format-insensitive comparison
+    (e.g. 'P-256'/'P256'/'p256' -> 'p256', 'ED25519' -> 'ed25519'). vcert's KeyType stores
+    the curve option lowercased, while the module receives the user's value verbatim, so both
+    operands must be normalized or an already-correct ECDSA key is judged wrong and the
+    certificate re-enrolls on every run."""
+    return str(curve).lower().replace("-", "") if curve is not None else curve
 
 
 class VCertificate:
@@ -425,7 +464,7 @@ class VCertificate:
             if self.privatekey_size != r.key_type.option:
                 return False
         if key_type == "ec" and self.privatekey_curve:
-            if self.privatekey_curve != r.key_type.option:
+            if _normalize_curve(self.privatekey_curve) != _normalize_curve(r.key_type.option):
                 return False
         return True
 
@@ -466,8 +505,12 @@ class VCertificate:
             if self._check_private_key_correct() and not self.privatekey_reuse:
                 private_key = to_text(open(self.privatekey_filename, "rb").read())
                 request.private_key = private_key
-            elif self.privatekey_type:
-                request.key_type = self._get_key_type()
+            else:
+                if self.privatekey_type:
+                    request.key_type = self._get_key_type()
+                # vcert generates a new key pair for this request; make sure it is serialized to
+                # disk. Previously this only happened when privatekey_type was set explicitly, so a
+                # default local-CSR enrollment left the private key file unwritten (VC-59232 #2).
                 self.serialize_private_key = True
         else:
             self.module.fail_json(msg="Failed to determine %s: %s" % (F_CSR_ORIGIN, self.csr_origin))
@@ -508,9 +551,9 @@ class VCertificate:
             self.module.fail_json(msg=("Failed to determine key type: %s. Must be RSA or ECDSA"
                                        % self.privatekey_type))
         if key_type == "rsa":
-            return KeyType(KeyType.RSA, self.privatekey_size)
+            return KeyType(KeyType.RSA, self.privatekey_size or 2048)
         elif key_type == "ecdsa" or key_type == "ec":
-            return KeyType(KeyType.ECDSA, self.privatekey_curve)
+            return KeyType(KeyType.ECDSA, self.privatekey_curve or "P521")
         else:
             self.module.fail_json(msg=("Failed to determine key type: %s. Must be RSA or ECDSA"
                                        % self.privatekey_type))
@@ -531,7 +574,8 @@ class VCertificate:
     def _atomic_write(self, path, content):
         suffix = ".atomic_%s" % random.randint(100, 100000)
         try:
-            with open(path + suffix, "wb") as f:
+            fd = os.open(path + suffix, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as f:
                 f.write(to_bytes(content))
         except OSError as e:
             self.module.fail_json(msg="Failed to write file %s: %s" % (
@@ -544,6 +588,10 @@ class VCertificate:
     def _check_and_update_permissions(self, path):
         file_args = self.module.load_file_common_arguments(self.module.params)
         file_args['path'] = path
+        # Default to mode 0600 for private keys and PKCS#12 files
+        if file_args.get('mode') is None:
+            if path == self.privatekey_filename or (self.use_pkcs12 and path == self.certificate_filename):
+                file_args['mode'] = '0600'
         if self.module.set_fs_attributes_if_different(file_args, False):
             self.changed = True
 
@@ -578,32 +626,37 @@ class VCertificate:
                 % (cn, self.common_name)
             )
             return False
+        # cryptography's not_valid_after/before are deprecated for the timezone-aware
+        # _utc variants. Use those and compare against an aware UTC "now" so the comparison
+        # is correct regardless of the controller's local timezone (the naive properties
+        # return UTC, but datetime.now() is local).
+        not_valid_after = cert.not_valid_after_utc
+        not_valid_before = cert.not_valid_before_utc
+        now = datetime.datetime.now(datetime.timezone.utc)
         # Check if certificate not already expired
-        if cert.not_valid_after < datetime.datetime.now():
+        if not_valid_after < now:
             self.changed_message.append(
                 'Certificate expiration date %s '
                 'is less than current time %s (certificate expired)'
-                % (cert.not_valid_after, self.before_expired_hours)
+                % (not_valid_after, self.before_expired_hours)
             )
             return False
         # Check if certificate expiring time is greater than
         # before_expired_hours (only for creating new certificate)
         if not validate:
-            if cert.not_valid_after - datetime.timedelta(
-                    hours=self.before_expired_hours) < datetime.datetime.now():
+            if not_valid_after - datetime.timedelta(
+                    hours=self.before_expired_hours) < now:
                 self.changed_message.append(
                     'Hours before certificate expiration date %s '
                     'is less than before_expired_hours value %s'
-                    % (cert.not_valid_after, self.before_expired_hours)
+                    % (not_valid_after, self.before_expired_hours)
                 )
                 return False
-        if cert.not_valid_before - datetime.timedelta(
-                hours=24) > datetime.datetime.now():
+        if not_valid_before - datetime.timedelta(hours=24) > now:
             self.changed_message.append(
                 "Certificate expiration date %s "
                 "is set to future from server time %s."
-                % (cert.not_valid_before - datetime.timedelta(hours=24),
-                   (datetime.datetime.now()))
+                % (not_valid_before - datetime.timedelta(hours=24), now)
             )
             return False
         ips = []
@@ -671,10 +724,21 @@ class VCertificate:
         return all(self._check_file_permissions(x) for x in files)
 
     def _check_file_permissions(self, path, update=False):
-        return True  # todo: write
+        if not path or not os.path.exists(path):
+            return True
+        # Check that private keys and PKCS#12 files have secure permissions (0600)
+        if path == self.privatekey_filename or (self.use_pkcs12 and path == self.certificate_filename):
+            st = os.stat(path)
+            # Ensure no group or other permissions (check bits 077)
+            if (st.st_mode & 0o077) != 0:
+                return False
+        return True
 
     def check(self, validate):
         """Return true if running will change anything"""
+        # Reset accumulated messages so that main() calling check() and then validate() (which
+        # calls check() again) does not produce duplicated error text (VC-59232 #3).
+        self.changed_message = []
         result = {
             'cert_file_exists': True,
             'changed': False,
@@ -765,12 +829,12 @@ def main():
         custom_fields=dict(type='dict', required=False),
         issuer_hint=dict(type='str', choices=[DEFAULT, DIGICERT, ENTRUST, MICROSOFT], default=DEFAULT, required=False),
         path=dict(type='path', aliases=['cert_path'], required=True),
-        privatekey_curve=dict(type='str', required=False),
+        privatekey_curve=dict(type='str', required=False, choices=['P256', 'P384', 'P521', 'ed25519']),
         privatekey_passphrase=dict(type='str', no_log=True),
         privatekey_path=dict(type='path', required=False),
         privatekey_reuse=dict(type='bool', required=False, default=True),
-        privatekey_size=dict(type='int', required=False),
-        privatekey_type=dict(type='str', required=False),
+        privatekey_size=dict(type='int', required=False, choices=[2048, 3072, 4096, 8192]),
+        privatekey_type=dict(type='str', required=False, choices=['RSA', 'ECDSA']),
         renew=dict(type='bool', required=False, default=True),
         use_pkcs12_format=dict(type='bool', default=False, required=False),
         validity_hours=dict(type='int', required=False),

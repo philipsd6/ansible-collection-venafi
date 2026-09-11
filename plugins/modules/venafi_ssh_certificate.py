@@ -229,10 +229,10 @@ import os
 from ansible.module_utils.basic import AnsibleModule
 try:
     from ansible_collections.venafi.machine_identity.plugins.module_utils.common_utils \
-        import get_venafi_connection, module_common_argument_spec, venafi_common_argument_spec
+        import get_venafi_connection, module_common_argument_spec, venafi_common_argument_spec, fail_if_ngts
 except ImportError:
     from plugins.module_utils.common_utils \
-        import get_venafi_connection, module_common_argument_spec, venafi_common_argument_spec
+        import get_venafi_connection, module_common_argument_spec, venafi_common_argument_spec, fail_if_ngts
 
 HAS_VCERT = True
 try:
@@ -278,6 +278,7 @@ class VSSHCertificate:
         :param AnsibleModule module:
         """
         self.module = module  # type: AnsibleModule
+        fail_if_ngts(module, "SSH certificate management")
         self.connection = get_venafi_connection(module)  # type: CommonConnection
         self.state = module.params[F_STATE]  # type: str
         self.force = module.params[F_FORCE]  # type: bool
@@ -422,7 +423,9 @@ class VSSHCertificate:
         if private_key_data:
             if not self.windows_cert:
                 private_key_data = private_key_data.replace("\r\n", "\n")
-            with open(self.private_key_filename, "wb") as private_key_file:
+            fd = os.open(self.private_key_filename, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as private_key_file:
+                os.fchmod(fd, 0o600)
                 private_key_file.write(private_key_data.encode())
                 self.private_key_changed = True
 

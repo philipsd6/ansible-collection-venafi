@@ -82,11 +82,24 @@ ansible-molecule:
 #	--extra-vars "credentials_file=fake_credentials.yml docker_demo=true"
 
 unit-test:
-	PYTHONPATH=./:$PYTHONPATH pytest ./tests/certificate/test_venafi_certificate.py
+	PYTHONPATH=./:$PYTHONPATH pytest ./tests/certificate/test_venafi_certificate.py ./tests/certificate/test_vc59232_local_csr.py ./tests/certificate/test_key_type_and_idempotency.py ./tests/common_utils/test_common_utils.py ./tests/revocation/test_revocation.py ./tests/policy/test_policy_utils.py
 
 install:
 	ansible-galaxy collection build --force
-	ansible-galaxy collection install venafi-machine_identity-1.0.1.tar.gz --force
+	ansible-galaxy collection install "venafi-machine_identity-$$(awk '/^version:/{print $$2}' galaxy.yml).tar.gz" --force
 
 uninstall:
 	rm -rf ~/.ansible/collections/ansible_collections/venafi
+
+# Regenerate requirements.txt from requirements.in using pip-compile.
+# Uses python:3.9 to match the CI target version so resolutions are reproducible.
+# pip-tools is pinned so hash output is stable across contributors.
+# chown at the end so the regenerated file is owned by the host user, not
+# root.
+lock:
+	docker run --rm -v "$(CURDIR)":/work -w /work python:3.9 \
+	  sh -c "pip install 'pip-tools==7.4.1' && \
+	         pip-compile --generate-hashes --output-file=requirements.txt requirements.in && \
+	         chown $$(id -u):$$(id -g) requirements.txt"
+
+.PHONY: lock
